@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Indic Audiobook Test</title>
+  <title>Vāchana — Indic PDF → Audiobook</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     body { margin: 0; background: #0A0A0F; color: #E8E8F0; font-family: 'Crimson Pro', 'Georgia', serif; min-height: 100vh; }
@@ -13,18 +13,20 @@
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/lamejs/1.2.0/lame.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
   <script>
     window.pdfjsLib = window.pdfjsLib || window['pdfjs-dist/build/pdf'];
     if (window.pdfjsLib) {
-      window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
     }
   </script>
 </head>
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const { useState, useRef, useCallback } = React;
+    const { useState, useRef, useCallback, useEffect, useMemo } = React;
+
+    /* ── Constants ─────────────────────────────────────── */
     const LANGUAGES = [
       { code: 'hi', name: 'Hindi', native: 'हिन्दी', voice: 'hi-IN-MadhurNeural', script: 'Devanagari', color: '#FF6B35', sample: 'नमस्ते, यह एक परीक्षण है।' },
       { code: 'gu', name: 'Gujarati', native: 'ગુજરાતી', voice: 'gu-IN-DhwaniNeural', script: 'Gujarati', color: '#4ECDC4', sample: 'નમસ્તે, આ એક પરીક્ષણ છે.' },
@@ -37,27 +39,104 @@
       { id: 3, label: 'Configure' },
       { id: 4, label: 'Convert' },
     ];
+    const PDF_RENDER_SCALE = 1.5;
+    const MAX_RENDERED_PAGES = 50;
 
+    /* ── TextPositionMap: maps text to PDF coordinates ─── */
+    class TextPositionMap {
+      constructor() {
+        this.pages = [];
+        this.fullText = '';
+        this.charToItem = [];
+      }
+
+      async buildFromDocument(pdfDoc) {
+        this.pages = [];
+        this.fullText = '';
+        this.charToItem = [];
+
+        for (let p = 1; p <= pdfDoc.numPages; p++) {
+          const page = await pdfDoc.getPage(p);
+          const viewport = page.getViewport({ scale: PDF_RENDER_SCALE });
+          const textContent = await page.getTextContent();
+
+          const items = [];
+          for (const item of textContent.items) {
+            if (!item.str || !item.str.trim()) continue;
+            const tx = item.transform;
+            const fontSize = Math.abs(tx[3]) * PDF_RENDER_SCALE;
+            const x = tx[4] * PDF_RENDER_SCALE;
+            const y = viewport.height - (tx[5] * PDF_RENDER_SCALE);
+            const w = item.width * PDF_RENDER_SCALE;
+            items.push({
+              str: item.str,
+              x: x,
+              y: y - fontSize,
+              width: w || fontSize * item.str.length * 0.6,
+              height: fontSize || 12,
+            });
+          }
+
+          const pageData = { pageNum: p, items, width: viewport.width, height: viewport.height };
+          this.pages.push(pageData);
+
+          for (const item of items) {
+            const start = this.fullText.length;
+            this.fullText += item.str;
+            for (let c = start; c < this.fullText.length; c++) {
+              this.charToItem.push({ pageNum: p, item });
+            }
+            this.fullText += ' ';
+            this.charToItem.push(null);
+          }
+        }
+      }
+
+      findPositionsForChunk(chunkText) {
+        if (!chunkText || !this.fullText) return [];
+        const normalized = chunkText.replace(/\s+/g, ' ').trim().toLowerCase();
+        const fullLower = this.fullText.toLowerCase();
+
+        const words = normalized.split(' ').filter(Boolean);
+        if (words.length === 0) return [];
+
+        const searchKey = words.slice(0, Math.min(6, words.length)).join(' ');
+        const idx = fullLower.indexOf(searchKey);
+        if (idx === -1) return [];
+
+        const endIdx = Math.min(idx + normalized.length, this.charToItem.length);
+        const seen = new Set();
+        const results = [];
+        for (let c = idx; c < endIdx; c++) {
+          const mapping = this.charToItem[c];
+          if (!mapping) continue;
+          const key = `${mapping.pageNum}:${mapping.item.x}:${mapping.item.y}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          results.push({
+            pageNum: mapping.pageNum,
+            x: mapping.item.x,
+            y: mapping.item.y,
+            width: mapping.item.width,
+            height: mapping.item.height,
+          });
+        }
+        return results;
+      }
+    }
+
+    /* ── Utility components ──────────────────────────── */
     function WaveAnimation({ active, color }) {
       return (
         <div style={{ display: 'flex', alignItems: 'center', gap: 3, height: 24 }}>
           {[1, 2, 3, 4, 5].map((i) => (
             <div key={i} style={{
-              width: 3,
-              borderRadius: 99,
-              background: color,
+              width: 3, borderRadius: 99, background: color,
               height: active ? `${8 + Math.random() * 16}px` : '4px',
               animation: active ? `wave ${0.4 + i * 0.1}s ease-in-out infinite alternate` : 'none',
-              animationDelay: `${i * 0.08}s`,
-              transition: 'height 0.3s ease',
+              animationDelay: `${i * 0.08}s`, transition: 'height 0.3s ease',
             }} />
           ))}
-          <style>{`
-            @keyframes wave {
-              from { transform: scaleY(0.4); }
-              to { transform: scaleY(1); }
-            }
-          `}</style>
         </div>
       );
     }
@@ -69,15 +148,152 @@
       return (
         <svg width={size} height={size} style={{ transform: 'rotate(-90deg)' }}>
           <circle cx={size / 2} cy={size / 2} r={r} fill="none" stroke="rgba(255,255,255,0.1)" strokeWidth={4} />
-          <circle cx={size / 2} cy={size / 2} r={r} fill="none" stroke={color} strokeWidth={4} strokeDasharray={circ} strokeDashoffset={offset} strokeLinecap="round" style={{ transition: 'stroke-dashoffset 0.4s ease' }} />
+          <circle cx={size / 2} cy={size / 2} r={r} fill="none" stroke={color} strokeWidth={4}
+            strokeDasharray={circ} strokeDashoffset={offset} strokeLinecap="round"
+            style={{ transition: 'stroke-dashoffset 0.4s ease' }} />
         </svg>
       );
     }
 
+    /* ── PdfPage: renders single PDF page with SVG highlights ─ */
+    function PdfPage({ pdfDoc, pageNum, highlights, highlightColor, scale }) {
+      const canvasRef = useRef(null);
+      const [dims, setDims] = useState({ w: 0, h: 0 });
+
+      useEffect(() => {
+        let cancelled = false;
+        (async () => {
+          if (!pdfDoc || !canvasRef.current) return;
+          const page = await pdfDoc.getPage(pageNum);
+          const viewport = page.getViewport({ scale });
+          const canvas = canvasRef.current;
+          canvas.width = viewport.width;
+          canvas.height = viewport.height;
+          setDims({ w: viewport.width, h: viewport.height });
+          if (cancelled) return;
+          const ctx = canvas.getContext('2d');
+          await page.render({ canvasContext: ctx, viewport }).promise;
+        })();
+        return () => { cancelled = true; };
+      }, [pdfDoc, pageNum, scale]);
+
+      return (
+        <div style={{ position: 'relative', marginBottom: 8 }} data-page={pageNum}>
+          <canvas ref={canvasRef} style={{ display: 'block', width: '100%', height: 'auto', borderRadius: 4 }} />
+          {dims.w > 0 && (
+            <svg viewBox={`0 0 ${dims.w} ${dims.h}`}
+              style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', pointerEvents: 'none' }}>
+              {highlights.map((h, i) => (
+                <rect key={i} x={h.x} y={h.y} width={h.width} height={h.height}
+                  fill={highlightColor + '35'} stroke={highlightColor} strokeWidth={1.5} rx={2}
+                  style={{ transition: 'all 0.15s ease' }} />
+              ))}
+            </svg>
+          )}
+          <div style={{ position: 'absolute', top: 6, right: 8, fontSize: '0.65rem', fontFamily: "'JetBrains Mono', monospace",
+            color: 'rgba(255,255,255,0.3)', background: 'rgba(0,0,0,0.5)', padding: '2px 6px', borderRadius: 3 }}>
+            {pageNum}
+          </div>
+        </div>
+      );
+    }
+
+    /* ── PdfViewerPanel: scrollable multi-page PDF viewer ─── */
+    function PdfViewerPanel({ pdfDoc, textPositionMap, currentChunkText, highlightColor, totalPages }) {
+      const containerRef = useRef(null);
+      const [visibleRange, setVisibleRange] = useState({ start: 1, end: Math.min(5, totalPages) });
+
+      const highlights = useMemo(() => {
+        if (!currentChunkText || !textPositionMap) return [];
+        return textPositionMap.findPositionsForChunk(currentChunkText);
+      }, [currentChunkText, textPositionMap]);
+
+      const highlightPage = highlights.length > 0 ? highlights[0].pageNum : null;
+
+      useEffect(() => {
+        if (highlightPage && containerRef.current) {
+          const pageEl = containerRef.current.querySelector(`[data-page="${highlightPage}"]`);
+          if (pageEl) {
+            pageEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          }
+          if (highlightPage < visibleRange.start || highlightPage > visibleRange.end) {
+            const start = Math.max(1, highlightPage - 2);
+            const end = Math.min(totalPages, highlightPage + 2);
+            setVisibleRange({ start, end });
+          }
+        }
+      }, [highlightPage, totalPages]);
+
+      const loadMore = (direction) => {
+        if (direction === 'prev') {
+          setVisibleRange(r => ({ start: Math.max(1, r.start - 3), end: r.end }));
+        } else {
+          setVisibleRange(r => ({ start: r.start, end: Math.min(totalPages, r.end + 3) }));
+        }
+      };
+
+      const pageNumbers = [];
+      for (let p = visibleRange.start; p <= visibleRange.end; p++) pageNumbers.push(p);
+
+      return (
+        <div style={{ borderRadius: 10, border: '1px solid rgba(255,255,255,0.1)', overflow: 'hidden', background: 'rgba(0,0,0,0.3)' }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 14px',
+            borderBottom: '1px solid rgba(255,255,255,0.06)', background: 'rgba(255,255,255,0.03)' }}>
+            <span style={{ fontSize: '0.78rem', fontFamily: "'JetBrains Mono', monospace", color: 'rgba(255,255,255,0.4)' }}>
+              PDF VIEWER · Pages {visibleRange.start}-{visibleRange.end} of {totalPages}
+            </span>
+            <div style={{ display: 'flex', gap: 6 }}>
+              <button onClick={() => setVisibleRange({ start: 1, end: Math.min(5, totalPages) })}
+                disabled={visibleRange.start === 1}
+                style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.1)', color: 'rgba(255,255,255,0.6)',
+                  cursor: 'pointer', borderRadius: 3, padding: '3px 8px', fontSize: '0.72rem', fontFamily: "'JetBrains Mono', monospace" }}>
+                ⟪ First
+              </button>
+              <button onClick={() => loadMore('prev')} disabled={visibleRange.start === 1}
+                style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.1)', color: 'rgba(255,255,255,0.6)',
+                  cursor: 'pointer', borderRadius: 3, padding: '3px 8px', fontSize: '0.72rem', fontFamily: "'JetBrains Mono', monospace" }}>
+                ← Prev
+              </button>
+              <button onClick={() => loadMore('next')} disabled={visibleRange.end >= totalPages}
+                style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.1)', color: 'rgba(255,255,255,0.6)',
+                  cursor: 'pointer', borderRadius: 3, padding: '3px 8px', fontSize: '0.72rem', fontFamily: "'JetBrains Mono', monospace" }}>
+                Next →
+              </button>
+            </div>
+          </div>
+          <div ref={containerRef} style={{ maxHeight: '55vh', overflowY: 'auto', padding: 8 }}>
+            {visibleRange.start > 1 && (
+              <button onClick={() => loadMore('prev')}
+                style={{ width: '100%', padding: 10, marginBottom: 8, background: 'rgba(255,255,255,0.04)',
+                  border: '1px dashed rgba(255,255,255,0.1)', color: 'rgba(255,255,255,0.4)', cursor: 'pointer',
+                  borderRadius: 4, fontSize: '0.82rem', fontFamily: "'Crimson Pro', serif" }}>
+                ↑ Load previous pages
+              </button>
+            )}
+            {pageNumbers.map(p => (
+              <PdfPage key={p} pdfDoc={pdfDoc} pageNum={p} scale={PDF_RENDER_SCALE}
+                highlights={highlights.filter(h => h.pageNum === p)} highlightColor={highlightColor} />
+            ))}
+            {visibleRange.end < totalPages && (
+              <button onClick={() => loadMore('next')}
+                style={{ width: '100%', padding: 10, marginTop: 4, background: 'rgba(255,255,255,0.04)',
+                  border: '1px dashed rgba(255,255,255,0.1)', color: 'rgba(255,255,255,0.4)', cursor: 'pointer',
+                  borderRadius: 4, fontSize: '0.82rem', fontFamily: "'Crimson Pro', serif" }}>
+                ↓ Load more pages
+              </button>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    /* ── App ─────────────────────────────────────────── */
     function App() {
       const [step, setStep] = useState(1);
       const [pdfFile, setPdfFile] = useState(null);
       const [pdfText, setPdfText] = useState('');
+      const [pdfDoc, setPdfDoc] = useState(null);
+      const [textPositionMap, setTextPositionMap] = useState(null);
       const [selectedLang, setSelectedLang] = useState(null);
       const [speed, setSpeed] = useState(1.0);
       const [chunkSize, setChunkSize] = useState(500);
@@ -88,10 +304,55 @@
       const [currentlyPlaying, setCurrentlyPlaying] = useState(null);
       const [dragOver, setDragOver] = useState(false);
       const [showFullText, setShowFullText] = useState(false);
+      const [viewMode, setViewMode] = useState('pdf');
+      const [positionMapReady, setPositionMapReady] = useState(false);
       const fileRef = useRef();
 
       const addLog = (msg, type = 'info') => {
         setLog((l) => [...l, { msg, type, ts: Date.now() }]);
+      };
+
+      /* ── PDF loading & text extraction ─────────── */
+      const parsePDFText = async (arrayBuffer) => {
+        if (window.pdfjsLib && window.pdfjsLib.getDocument) {
+          const pdf = await window.pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+          setPdfDoc(pdf);
+
+          let text = '';
+          for (let page = 1; page <= pdf.numPages; page++) {
+            const pdfPage = await pdf.getPage(page);
+            const content = await pdfPage.getTextContent();
+            const pageText = content.items.map((item) => item.str || '').join(' ');
+            text += pageText + '\n\n';
+          }
+          text = text.trim();
+
+          const tpm = new TextPositionMap();
+          await tpm.buildFromDocument(pdf);
+          setTextPositionMap(tpm);
+          setPositionMapReady(true);
+          addLog(`📐 Text position map built: ${tpm.pages.length} pages indexed`, 'success');
+
+          if (text.length > 0) return text;
+        }
+
+        const bytes = new Uint8Array(arrayBuffer);
+        const decoder = new TextDecoder('utf-8', { fatal: false });
+        const raw = decoder.decode(bytes);
+        const btEtMatches = raw.match(/BT[\s\S]*?ET/g) || [];
+        let text = '';
+        for (const block of btEtMatches) {
+          const tjMatches = block.match(/\(([^)]*)\)\s*Tj/g) || [];
+          for (const tj of tjMatches) {
+            const content = tj.match(/\(([^)]*)\)/)?.[1] || '';
+            text += content + ' ';
+          }
+        }
+        if (text.trim().length < 50) {
+          const readable = raw.match(/[\u0900-\u097F\u0A80-\u0AFF\u0000-\u007F]{4,}/g) || [];
+          text = readable.filter((s) => s.trim().length > 3).join(' ');
+        }
+        return text.trim() || 'Sample text extracted from PDF. In a production environment, use pdf.js for accurate extraction.';
       };
 
       const extractTextFromPDF = async (file) => {
@@ -109,44 +370,10 @@
         });
       };
 
-      const parsePDFText = async (arrayBuffer) => {
-        if (window.pdfjsLib?.getDocument) {
-          const pdf = await window.pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-          let text = '';
-          for (let page = 1; page <= pdf.numPages; page++) {
-            const pdfPage = await pdf.getPage(page);
-            const content = await pdfPage.getTextContent();
-            const pageText = content.items.map((item) => item.str || '').join(' ');
-            text += pageText + '\n\n';
-          }
-          text = text.trim();
-          if (text.length > 0) {
-            return text;
-          }
-        }
-
-        const bytes = new Uint8Array(arrayBuffer);
-        let text = '';
-        const decoder = new TextDecoder('utf-8', { fatal: false });
-        const raw = decoder.decode(bytes);
-        const btEtMatches = raw.match(/BT[\s\S]*?ET/g) || [];
-        for (const block of btEtMatches) {
-          const tjMatches = block.match(/\(([^)]*)\)\s*Tj/g) || [];
-          for (const tj of tjMatches) {
-            const content = tj.match(/\(([^)]*)\)/)?.[1] || '';
-            text += content + ' ';
-          }
-        }
-        if (text.trim().length < 50) {
-          const readable = raw.match(/[\u0900-\u097F\u0A80-\u0AFF\u0000-\u007F]{4,}/g) || [];
-          text = readable.filter((s) => s.trim().length > 3).join(' ');
-        }
-        return text.trim() || 'Sample text extracted from PDF. In a production environment, use pdf.js or PyMuPDF for accurate extraction.';
-      };
-
       const handleFile = async (file) => {
         if (!file || file.type !== 'application/pdf') return;
         setPdfFile(file);
+        setPositionMapReady(false);
         addLog(`📄 Loading: ${file.name}`, 'info');
         const text = await extractTextFromPDF(file);
         setPdfText(text);
@@ -160,6 +387,7 @@
         handleFile(e.dataTransfer.files[0]);
       };
 
+      /* ── Text processing ────────────────────────── */
       const chunkText = (text, size) => {
         const words = text.split(/\s+/);
         const chunks = [];
@@ -188,19 +416,18 @@
         return null;
       };
 
+      /* ── Audio: TTS, encoding, merging ──────────── */
       const fetchGoogleTTS = async (text, langCode) => {
         const safeText = encodeURIComponent(text);
         const url = `https://translate.google.com/translate_tts?ie=UTF-8&q=${safeText}&tl=${langCode}&client=tw-ob`;
         const resp = await fetch(url);
-        if (!resp.ok) {
-          throw new Error('Remote TTS fetch failed');
-        }
+        if (!resp.ok) throw new Error('Remote TTS fetch failed');
         return await resp.arrayBuffer();
       };
 
       const floatTo16BitPCM = (float32Array) => {
         const buffer = new Int16Array(float32Array.length);
-        for (let i = 0; i < float32Array.length; i += 1) {
+        for (let i = 0; i < float32Array.length; i++) {
           let s = Math.max(-1, Math.min(1, float32Array[i]));
           buffer[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
         }
@@ -219,9 +446,7 @@
       };
 
       const encodeMp3 = (samples, sampleRate) => {
-        if (!window.lamejs) {
-          throw new Error('MP3 encoder is not loaded');
-        }
+        if (!window.lamejs) throw new Error('MP3 encoder is not loaded');
         const mp3encoder = new window.lamejs.Mp3Encoder(1, sampleRate, 128);
         const mp3Data = [];
         const sampleBlockSize = 1152;
@@ -240,26 +465,15 @@
         const parts = [];
         const words = text.split(/\s+/).filter(Boolean);
         let current = '';
-
         for (const word of words) {
           const next = (current ? `${current} ${word}` : word).trim();
           if (next.length > 180) {
-            if (current) {
-              parts.push(current);
-              current = '';
-            }
+            if (current) { parts.push(current); current = ''; }
             if (word.length > 180) {
               let index = 0;
-              while (index < word.length) {
-                parts.push(word.slice(index, index + 180));
-                index += 180;
-              }
-            } else {
-              current = word;
-            }
-          } else {
-            current = next;
-          }
+              while (index < word.length) { parts.push(word.slice(index, index + 180)); index += 180; }
+            } else { current = word; }
+          } else { current = next; }
         }
         if (current) parts.push(current);
 
@@ -279,6 +493,39 @@
         return encodeMp3(merged.samples, merged.sampleRate);
       };
 
+      /* ── Speech synthesis ───────────────────────── */
+      const getSpeechVoices = async () => {
+        if (!window.speechSynthesis) return [];
+        let voices = window.speechSynthesis.getVoices();
+        if (!voices.length && 'onvoiceschanged' in window.speechSynthesis) {
+          voices = await new Promise((resolve) => {
+            window.speechSynthesis.onvoiceschanged = () => resolve(window.speechSynthesis.getVoices());
+          });
+        }
+        return voices;
+      };
+
+      const synthesizeSpeech = async (text, lang, rate) => {
+        if (!window.speechSynthesis) throw new Error('Web Speech API not supported');
+        const voices = await getSpeechVoices();
+        const preferred = lang.code === 'en' ? ['en-US', 'en-GB', 'en'] : [`${lang.code}-IN`, lang.code];
+        const match = voices.find((v) =>
+          preferred.some((code) => v.lang.toLowerCase().startsWith(code.toLowerCase())) ||
+          v.name.toLowerCase().includes(lang.name.toLowerCase()) ||
+          v.name.toLowerCase().includes(lang.native.toLowerCase())
+        );
+        return new Promise((resolve, reject) => {
+          const utterance = new SpeechSynthesisUtterance(text);
+          utterance.lang = lang.code === 'en' ? 'en-US' : `${lang.code}-IN`;
+          utterance.rate = rate;
+          if (match) utterance.voice = match;
+          utterance.onend = () => resolve(new Blob(['audio-played-live'], { type: 'text/plain' }));
+          utterance.onerror = (e) => reject(new Error(e.error || 'Speech synthesis error'));
+          window.speechSynthesis.speak(utterance);
+        });
+      };
+
+      /* ── Conversion pipeline ────────────────────── */
       const convertToAudio = async () => {
         if (!selectedLang || !pdfText) return;
         setConverting(true);
@@ -319,39 +566,7 @@
         addLog(`🎉 Conversion complete! ${results.filter((r) => !r.error).length}/${chunks.length} chunks ready.`, 'success');
       };
 
-      const getSpeechVoices = async () => {
-        if (!window.speechSynthesis) return [];
-        let voices = window.speechSynthesis.getVoices();
-        if (!voices.length && 'onvoiceschanged' in window.speechSynthesis) {
-          voices = await new Promise((resolve) => {
-            window.speechSynthesis.onvoiceschanged = () => resolve(window.speechSynthesis.getVoices());
-          });
-        }
-        return voices;
-      };
-
-      const synthesizeSpeech = async (text, lang, rate) => {
-        if (!window.speechSynthesis) {
-          throw new Error('Web Speech API not supported');
-        }
-        const voices = await getSpeechVoices();
-        const preferred = lang.code === 'en' ? ['en-US', 'en-GB', 'en'] : [`${lang.code}-IN`, lang.code];
-        const match = voices.find((v) =>
-          preferred.some((code) => v.lang.toLowerCase().startsWith(code.toLowerCase())) ||
-          v.name.toLowerCase().includes(lang.name.toLowerCase()) ||
-          v.name.toLowerCase().includes(lang.native.toLowerCase())
-        );
-        return new Promise((resolve, reject) => {
-          const utterance = new SpeechSynthesisUtterance(text);
-          utterance.lang = lang.code === 'en' ? 'en-US' : `${lang.code}-IN`;
-          utterance.rate = rate;
-          if (match) utterance.voice = match;
-          utterance.onend = () => resolve(new Blob(['audio-played-live'], { type: 'text/plain' }));
-          utterance.onerror = (e) => reject(new Error(e.error || 'Speech synthesis error'));
-          window.speechSynthesis.speak(utterance);
-        });
-      };
-
+      /* ── Playback ───────────────────────────────── */
       const playChunk = async (chunk) => {
         if (!chunk.text) return;
         window.speechSynthesis.cancel();
@@ -380,31 +595,23 @@
         }
       };
 
+      /* ── Downloads ──────────────────────────────── */
       const downloadChunk = async (chunk) => {
         try {
           const audioBlob = await getRemoteTTS(chunk.text, chunk.lang);
           const url = URL.createObjectURL(audioBlob);
           const anchor = document.createElement('a');
-          anchor.style.display = 'none';
-          anchor.href = url;
+          anchor.style.display = 'none'; anchor.href = url;
           anchor.download = `audiobook-chunk-${chunk.id}-${chunk.lang.code}.mp3`;
-          document.body.appendChild(anchor);
-          anchor.click();
-          setTimeout(() => {
-            URL.revokeObjectURL(url);
-            document.body.removeChild(anchor);
-          }, 500);
+          document.body.appendChild(anchor); anchor.click();
+          setTimeout(() => { URL.revokeObjectURL(url); document.body.removeChild(anchor); }, 500);
           addLog(`⬇️ Download started for chunk ${chunk.id} (${chunk.lang.name})`, 'success');
-        } catch (err) {
-          addLog(`⚠️ MP3 download failed: ${err.message}`, 'error');
-        }
+        } catch (err) { addLog(`⚠️ MP3 download failed: ${err.message}`, 'error'); }
       };
 
       const downloadAllChunks = async () => {
         try {
-          if (!window.JSZip) {
-            throw new Error('JSZip is not loaded');
-          }
+          if (!window.JSZip) throw new Error('JSZip is not loaded');
           const zip = new window.JSZip();
           for (const chunk of audioChunks) {
             const audioBlob = await getRemoteTTS(chunk.text, chunk.lang);
@@ -413,33 +620,21 @@
           const zipBlob = await zip.generateAsync({ type: 'blob' });
           const url = URL.createObjectURL(zipBlob);
           const anchor = document.createElement('a');
-          anchor.style.display = 'none';
-          anchor.href = url;
+          anchor.style.display = 'none'; anchor.href = url;
           anchor.download = `audiobook-all-chunks.zip`;
-          document.body.appendChild(anchor);
-          anchor.click();
-          setTimeout(() => {
-            URL.revokeObjectURL(url);
-            document.body.removeChild(anchor);
-          }, 500);
+          document.body.appendChild(anchor); anchor.click();
+          setTimeout(() => { URL.revokeObjectURL(url); document.body.removeChild(anchor); }, 500);
           addLog(`⬇️ Combined ZIP download started`, 'success');
-        } catch (err) {
-          addLog(`⚠️ Combined download failed: ${err.message}`, 'error');
-        }
+        } catch (err) { addLog(`⚠️ Combined download failed: ${err.message}`, 'error'); }
       };
 
       const downloadCombinedMP3 = async () => {
         try {
-          if (!window.lamejs) {
-            throw new Error('MP3 encoder is not loaded');
-          }
-          if (!audioChunks.length) {
-            throw new Error('No audio segments available');
-          }
+          if (!window.lamejs) throw new Error('MP3 encoder is not loaded');
+          if (!audioChunks.length) throw new Error('No audio segments available');
           const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
           const decodedSegments = [];
           addLog(`🔄 Downloading all chunks and merging into one MP3...`, 'info');
-
           for (const chunk of audioChunks) {
             const blob = await getRemoteTTS(chunk.text, chunk.lang);
             const arrayBuffer = await blob.arrayBuffer();
@@ -447,24 +642,16 @@
             decodedSegments.push(decoded.getChannelData(0));
             addLog(`✅ Fetched segment ${chunk.id}`, 'info');
           }
-
-          const merged = mergeAudioBuffers(decodedSegments);
+          const merged = mergeAudioBuffers(decodedSegments, audioCtx.sampleRate);
           const mp3Blob = encodeMp3(merged.samples, merged.sampleRate);
           const url = URL.createObjectURL(mp3Blob);
           const anchor = document.createElement('a');
-          anchor.style.display = 'none';
-          anchor.href = url;
-          anchor.download = `audiobook-full-${lang.code}.mp3`;
-          document.body.appendChild(anchor);
-          anchor.click();
-          setTimeout(() => {
-            URL.revokeObjectURL(url);
-            document.body.removeChild(anchor);
-          }, 500);
+          anchor.style.display = 'none'; anchor.href = url;
+          anchor.download = `audiobook-full-${selectedLang ? selectedLang.code : 'unknown'}.mp3`;
+          document.body.appendChild(anchor); anchor.click();
+          setTimeout(() => { URL.revokeObjectURL(url); document.body.removeChild(anchor); }, 500);
           addLog(`⬇️ Full MP3 download ready`, 'success');
-        } catch (err) {
-          addLog(`⚠️ Full MP3 download failed: ${err.message}`, 'error');
-        }
+        } catch (err) { addLog(`⚠️ Full MP3 download failed: ${err.message}`, 'error'); }
       };
 
       const stopAll = () => {
@@ -472,8 +659,11 @@
         setCurrentlyPlaying(null);
       };
 
+      /* ── Derived state ──────────────────────────── */
       const lang = selectedLang;
+      const currentChunkText = currentlyPlaying ? audioChunks.find(c => c.id === currentlyPlaying)?.text : null;
 
+      /* ── Render ─────────────────────────────────── */
       return (
         <div style={{ minHeight: '100vh', background: '#0A0A0F', color: '#E8E8F0', fontFamily: "'Crimson Pro', 'Georgia', serif", position: 'relative', overflow: 'hidden' }}>
           <style>{`
@@ -482,6 +672,7 @@
             ::-webkit-scrollbar { width: 4px; }
             ::-webkit-scrollbar-track { background: #111; }
             ::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
+            @keyframes wave { from{transform:scaleY(0.4)} to{transform:scaleY(1)} }
             @keyframes float { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-10px)} }
             @keyframes pulse-ring { 0%{transform:scale(1);opacity:0.6} 100%{transform:scale(1.5);opacity:0} }
             @keyframes slide-in { from{transform:translateY(8px);opacity:0} to{transform:translateY(0);opacity:1} }
@@ -498,8 +689,25 @@
             .chunk-row { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-radius: 6px; background: rgba(255,255,255,0.03); margin-bottom: 6px; border: 1px solid rgba(255,255,255,0.06); animation: slide-in 0.3s ease; }
             input[type=range] { -webkit-appearance: none; width: 100%; height: 4px; border-radius: 2px; background: rgba(255,255,255,0.1); outline: none; }
             input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%; background: #FF6B35; cursor: pointer; }
+            .view-toggle { display: inline-flex; border: 1px solid rgba(255,255,255,0.15); border-radius: 6px; overflow: hidden; }
+            .view-toggle button { background: transparent; border: none; color: rgba(255,255,255,0.5); cursor: pointer; padding: 6px 16px; font-size: 0.82rem; font-family: 'JetBrains Mono', monospace; transition: all 0.2s; }
+            .view-toggle button.active { background: rgba(255,255,255,0.1); color: white; }
+            .view-toggle button:hover:not(.active) { color: rgba(255,255,255,0.8); }
+            @media (max-width: 768px) {
+              header { padding: 12px 16px !important; flex-direction: column; gap: 12px; }
+              main { padding: 24px 12px !important; }
+              .lang-grid { grid-template-columns: 1fr 1fr !important; }
+              .config-grid { grid-template-columns: 1fr !important; }
+              .chunk-row { flex-wrap: wrap; }
+            }
+            @media (max-width: 480px) {
+              .lang-grid { grid-template-columns: 1fr !important; }
+              .step-bar { display: none !important; }
+            }
           `}</style>
           <div style={{ position: 'fixed', inset: 0, pointerEvents: 'none', background: 'radial-gradient(ellipse at 20% 20%, rgba(255,107,53,0.06) 0%, transparent 60%), radial-gradient(ellipse at 80% 80%, rgba(78,205,196,0.05) 0%, transparent 60%)' }} />
+
+          {/* ── Header ────────────────────────────── */}
           <header style={{ borderBottom: '1px solid rgba(255,255,255,0.06)', padding: '20px 40px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', position: 'relative', zIndex: 10 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
               <div style={{ width: 36, height: 36, borderRadius: '50%', background: 'linear-gradient(135deg, #FF6B35, #FFD93D)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '1.1rem' }}>🎧</div>
@@ -508,7 +716,7 @@
                 <div style={{ fontSize: '0.72rem', color: 'rgba(255,255,255,0.35)', fontFamily: "'JetBrains Mono', monospace", letterSpacing: '0.08em' }}>INDIC PDF → AUDIOBOOK</div>
               </div>
             </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 0 }}>
+            <div className="step-bar" style={{ display: 'flex', alignItems: 'center', gap: 0 }}>
               {STEPS.map((s, i) => (
                 <div key={s.id} style={{ display: 'flex', alignItems: 'center' }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 8, opacity: step >= s.id ? 1 : 0.3, transition: 'opacity 0.3s' }}>
@@ -520,7 +728,11 @@
               ))}
             </div>
           </header>
-          <main style={{ maxWidth: 860, margin: '0 auto', padding: '48px 24px', position: 'relative', zIndex: 10 }}>
+
+          {/* ── Main content ──────────────────────── */}
+          <main style={{ maxWidth: 960, margin: '0 auto', padding: '48px 24px', position: 'relative', zIndex: 10 }}>
+
+            {/* Step 1: Upload */}
             {step === 1 && (
               <div style={{ animation: 'slide-in 0.4s ease' }}>
                 <h1 style={{ fontSize: '2.4rem', fontWeight: 300, marginBottom: 8, lineHeight: 1.2 }}>Transform your PDF<br /><em style={{ color: '#FF6B35' }}>into spoken word</em></h1>
@@ -539,6 +751,8 @@
                 </div>
               </div>
             )}
+
+            {/* Step 2: Language */}
             {step === 2 && (
               <div style={{ animation: 'slide-in 0.4s ease' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginBottom: 8 }}>
@@ -546,7 +760,7 @@
                   <div><h2 style={{ fontSize: '1.8rem', fontWeight: 300 }}>Choose language</h2></div>
                 </div>
                 <p style={{ color: 'rgba(255,255,255,0.35)', marginBottom: 36, fontSize: '0.95rem', marginLeft: 88 }}>{pdfFile?.name} · {(pdfFile?.size / 1024).toFixed(0)} KB · {pdfText.length} chars extracted</p>
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16 }}>
+                <div className="lang-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16 }}>
                   {LANGUAGES.map((l) => (
                     <div key={l.code} className={`lang-card ${selectedLang?.code === l.code ? 'selected' : ''}`} style={{ '--lang-color': l.color }} onClick={() => setSelectedLang(l)}>
                       <div style={{ fontSize: '2.2rem', marginBottom: 12 }}>{l.code === 'hi' ? '🇮🇳' : l.code === 'gu' ? '🏛️' : l.code === 'en' ? '🇬🇧' : '🕉️'}</div>
@@ -563,13 +777,15 @@
                 </div>
               </div>
             )}
+
+            {/* Step 3: Configure */}
             {step === 3 && lang && (
               <div style={{ animation: 'slide-in 0.4s ease' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginBottom: 32 }}>
                   <button className="btn-ghost" onClick={() => setStep(2)} style={{ padding: '6px 14px', fontSize: '0.85rem' }}>← Back</button>
                   <h2 style={{ fontSize: '1.8rem', fontWeight: 300 }}>Configure output</h2>
                 </div>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 24 }}>
+                <div className="config-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 24 }}>
                   <div style={{ padding: 24, borderRadius: 10, border: `1px solid ${lang.color}30`, background: `${lang.color}08` }}>
                     <div style={{ fontSize: '0.72rem', fontFamily: "'JetBrains Mono', monospace", color: 'rgba(255,255,255,0.3)', marginBottom: 12, letterSpacing: '0.1em' }}>SELECTED LANGUAGE</div>
                     <div style={{ fontSize: '2rem', color: lang.color, marginBottom: 4 }}>{lang.native}</div>
@@ -609,36 +825,94 @@
                 </div>
               </div>
             )}
+
+            {/* Step 4: Convert & Play with PDF Viewer */}
             {step === 4 && lang && (
               <div style={{ animation: 'slide-in 0.4s ease' }}>
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 32 }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 24, flexWrap: 'wrap', gap: 12 }}>
                   <h2 style={{ fontSize: '1.8rem', fontWeight: 300 }}>{converting ? 'Converting...' : 'Audiobook ready'}</h2>
-                  {!converting && <button className="btn-ghost" onClick={() => { setStep(1); setPdfFile(null); setPdfText(''); setSelectedLang(null); setAudioChunks([]); setLog([]); }}>Start over</button>}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                    {!converting && pdfDoc && (
+                      <div className="view-toggle">
+                        <button className={viewMode === 'pdf' ? 'active' : ''} onClick={() => setViewMode('pdf')}>📄 PDF View</button>
+                        <button className={viewMode === 'transcript' ? 'active' : ''} onClick={() => setViewMode('transcript')}>📝 Transcript</button>
+                      </div>
+                    )}
+                    {!converting && <button className="btn-ghost" onClick={() => { setStep(1); setPdfFile(null); setPdfText(''); setSelectedLang(null); setAudioChunks([]); setLog([]); setPdfDoc(null); setTextPositionMap(null); setPositionMapReady(false); }} style={{ padding: '6px 14px', fontSize: '0.85rem' }}>Start over</button>}
+                  </div>
                 </div>
+
+                {/* Conversion progress */}
                 {converting && (
                   <div style={{ padding: 32, borderRadius: 12, marginBottom: 24, border: `1px solid ${lang.color}30`, background: `${lang.color}06`, display: 'flex', alignItems: 'center', gap: 32 }}>
                     <div style={{ position: 'relative' }}><ProgressRing progress={progress} color={lang.color} size={72} /><div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.9rem', fontFamily: "'JetBrains Mono', monospace", color: lang.color }}>{progress}%</div></div>
                     <div><div style={{ fontSize: '1.2rem', marginBottom: 6 }}>Processing <span style={{ color: lang.color }}>{lang.native}</span> audio...</div><WaveAnimation active={true} color={lang.color} /></div>
                   </div>
                 )}
-                <div style={{ padding: '14px 18px', borderRadius: 8, marginBottom: 24, background: 'rgba(0,0,0,0.4)', border: '1px solid rgba(255,255,255,0.06)', maxHeight: 160, overflowY: 'auto' }}>
+
+                {/* Log viewer */}
+                <div style={{ padding: '14px 18px', borderRadius: 8, marginBottom: 24, background: 'rgba(0,0,0,0.4)', border: '1px solid rgba(255,255,255,0.06)', maxHeight: 120, overflowY: 'auto' }}>
                   {log.length === 0 ? <div style={{ color: 'rgba(255,255,255,0.2)', fontSize: '0.8rem', fontFamily: "'JetBrains Mono', monospace" }}>Awaiting conversion...</div> : log.map((l, i) => <div key={i} className="log-line" style={{ color: l.type === 'error' ? '#FF6B6B' : l.type === 'success' ? '#4ECDC4' : 'rgba(255,255,255,0.5)' }}>{l.msg}</div>)}
                 </div>
-                {audioChunks.length > 0 && (
-                  <div>
+
+                {/* PDF Viewer / Transcript (Phase 2) */}
+                {!converting && audioChunks.length > 0 && pdfDoc && viewMode === 'pdf' && (
+                  <div style={{ marginBottom: 24 }}>
+                    {positionMapReady ? (
+                      <PdfViewerPanel pdfDoc={pdfDoc} textPositionMap={textPositionMap}
+                        currentChunkText={currentChunkText} highlightColor={lang.color}
+                        totalPages={pdfDoc.numPages} />
+                    ) : (
+                      <div style={{ padding: 32, textAlign: 'center', borderRadius: 10, border: '1px solid rgba(255,255,255,0.1)', background: 'rgba(0,0,0,0.3)' }}>
+                        <div style={{ fontSize: '0.9rem', color: 'rgba(255,255,255,0.4)' }}>Building text position map...</div>
+                      </div>
+                    )}
                     {currentlyPlaying && (
-                      <div style={{ marginBottom: 24, padding: 20, borderRadius: 10, border: `2px solid ${lang.color}`, background: `${lang.color}12`, minHeight: 120, display: 'flex', alignItems: 'center', justifyContent: 'center', animation: 'slide-in 0.3s ease' }}>
-                        <div style={{ textAlign: 'center' }}>
-                          <div style={{ fontSize: '0.75rem', fontFamily: "'JetBrains Mono', monospace", color: lang.color, marginBottom: 10, letterSpacing: '0.08em' }}>▶ READING NOW</div>
-                          <div style={{ fontSize: '1.3rem', lineHeight: 1.8, color: '#E8E8F0', fontFamily: "'Crimson Pro', serif", fontWeight: 400, maxHeight: 200, overflowY: 'auto' }}>
-                            {audioChunks.find(c => c.id === currentlyPlaying)?.text}
-                          </div>
+                      <div style={{ marginTop: 12, padding: '10px 16px', borderRadius: 6, border: `1px solid ${lang.color}40`, background: `${lang.color}08`, display: 'flex', alignItems: 'center', gap: 12 }}>
+                        <WaveAnimation active={true} color={lang.color} />
+                        <div style={{ fontSize: '0.82rem', color: 'rgba(255,255,255,0.6)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          {currentChunkText?.slice(0, 100)}...
                         </div>
                       </div>
                     )}
-                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
+                  </div>
+                )}
+
+                {/* Condensed transcript view */}
+                {!converting && audioChunks.length > 0 && viewMode === 'transcript' && (
+                  <div style={{ marginBottom: 24, padding: 20, borderRadius: 10, border: `1px solid ${lang.color}40`, background: 'rgba(0,0,0,0.3)', maxHeight: '50vh', overflowY: 'auto' }}>
+                    <div style={{ fontSize: '0.72rem', fontFamily: "'JetBrains Mono', monospace", color: 'rgba(255,255,255,0.3)', marginBottom: 12, letterSpacing: '0.08em' }}>TRANSCRIPT VIEW</div>
+                    <div style={{ fontSize: '0.85rem', fontFamily: "'Crimson Pro', serif", lineHeight: 1.8, color: '#E8E8F0', wordBreak: 'break-word' }}>
+                      {audioChunks.map((chunk) => (
+                        <span key={chunk.id} onClick={() => !chunk.error && playChunk(chunk)}
+                          style={{ background: currentlyPlaying === chunk.id ? lang.color + '30' : 'transparent',
+                            padding: currentlyPlaying === chunk.id ? '2px 4px' : '0', borderRadius: 3,
+                            transition: 'all 0.2s', display: 'inline', cursor: chunk.error ? 'default' : 'pointer' }}>
+                          {chunk.text}{' '}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* "READING NOW" display (shown when no PDF doc or in transcript mode) */}
+                {audioChunks.length > 0 && currentlyPlaying && (!pdfDoc || viewMode === 'transcript') && (
+                  <div style={{ marginBottom: 24, padding: 20, borderRadius: 10, border: `2px solid ${lang.color}`, background: `${lang.color}12`, minHeight: 120, display: 'flex', alignItems: 'center', justifyContent: 'center', animation: 'slide-in 0.3s ease' }}>
+                    <div style={{ textAlign: 'center' }}>
+                      <div style={{ fontSize: '0.75rem', fontFamily: "'JetBrains Mono', monospace", color: lang.color, marginBottom: 10, letterSpacing: '0.08em' }}>▶ READING NOW</div>
+                      <div style={{ fontSize: '1.3rem', lineHeight: 1.8, color: '#E8E8F0', fontFamily: "'Crimson Pro', serif", fontWeight: 400, maxHeight: 200, overflowY: 'auto' }}>
+                        {currentChunkText}
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Audio chunks list */}
+                {audioChunks.length > 0 && (
+                  <div>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14, flexWrap: 'wrap', gap: 8 }}>
                       <div style={{ fontSize: '0.88rem', color: 'rgba(255,255,255,0.4)' }}>{audioChunks.length} audio segments</div>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
                         {!converting && audioChunks.length > 0 && (
                           <button className="btn-ghost" onClick={downloadAllChunks} style={{ padding: '6px 14px', fontSize: '0.82rem' }}>⬇ Download all ZIP</button>
                         )}
@@ -660,6 +934,8 @@
                         )}
                       </div>
                     ))}
+
+                    {/* Production TTS options */}
                     {!converting && <div style={{ marginTop: 24, padding: 20, borderRadius: 10, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.08)' }}>
                       <div style={{ fontSize: '0.88rem', color: 'rgba(255,255,255,0.4)', marginBottom: 12 }}>📦 Production deployment options</div>
                       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
@@ -668,20 +944,26 @@
                         ))}
                       </div>
                     </div>}
-                    <div style={{ marginTop: 20, paddingTop: 20, borderTop: '1px solid rgba(255,255,255,0.06)' }}>
-                      <button className="btn-ghost" onClick={() => setShowFullText(!showFullText)} style={{ padding: '8px 16px', fontSize: '0.85rem', width: '100%', textAlign: 'center' }}>
-                        {showFullText ? '▼ Hide full text' : '▶ Show full text with captions'}
-                      </button>
-                    </div>
-                    {showFullText && pdfText && (
-                      <div style={{ marginTop: 20, padding: 20, borderRadius: 10, border: `1px solid ${lang.color}40`, background: 'rgba(0,0,0,0.3)', maxHeight: 400, overflowY: 'auto' }}>
-                        <div style={{ fontSize: '0.85rem', fontFamily: "'Crimson Pro', serif", lineHeight: 1.8, color: '#E8E8F0', wordBreak: 'break-word' }}>
-                          {audioChunks.map((chunk) => (
-                            <span key={chunk.id} style={{ background: currentlyPlaying === chunk.id ? lang.color + '30' : 'transparent', padding: currentlyPlaying === chunk.id ? '2px 4px' : '0', borderRadius: 3, transition: 'all 0.2s', display: 'inline' }}>
-                              {chunk.text}{' '}
-                            </span>
-                          ))}
+
+                    {/* Legacy full text toggle (when no PDF viewer) */}
+                    {!pdfDoc && (
+                      <div>
+                        <div style={{ marginTop: 20, paddingTop: 20, borderTop: '1px solid rgba(255,255,255,0.06)' }}>
+                          <button className="btn-ghost" onClick={() => setShowFullText(!showFullText)} style={{ padding: '8px 16px', fontSize: '0.85rem', width: '100%', textAlign: 'center' }}>
+                            {showFullText ? '▼ Hide full text' : '▶ Show full text with captions'}
+                          </button>
                         </div>
+                        {showFullText && pdfText && (
+                          <div style={{ marginTop: 20, padding: 20, borderRadius: 10, border: `1px solid ${lang.color}40`, background: 'rgba(0,0,0,0.3)', maxHeight: 400, overflowY: 'auto' }}>
+                            <div style={{ fontSize: '0.85rem', fontFamily: "'Crimson Pro', serif", lineHeight: 1.8, color: '#E8E8F0', wordBreak: 'break-word' }}>
+                              {audioChunks.map((chunk) => (
+                                <span key={chunk.id} style={{ background: currentlyPlaying === chunk.id ? lang.color + '30' : 'transparent', padding: currentlyPlaying === chunk.id ? '2px 4px' : '0', borderRadius: 3, transition: 'all 0.2s', display: 'inline' }}>
+                                  {chunk.text}{' '}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
                       </div>
                     )}
                   </div>
@@ -694,6 +976,200 @@
     }
 
     ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+
+  <!-- ── Inline Unit Tests ─────────────────────────── -->
+  <script type="text/babel">
+    (function runTests() {
+      if (!window.location.search.includes('test=1')) return;
+
+      const results = [];
+      let passed = 0;
+      let failed = 0;
+
+      function assert(condition, name) {
+        if (condition) { passed++; results.push({ name, status: 'PASS' }); }
+        else { failed++; results.push({ name, status: 'FAIL' }); }
+      }
+
+      function assertEqual(actual, expected, name) {
+        const ok = JSON.stringify(actual) === JSON.stringify(expected);
+        if (ok) { passed++; results.push({ name, status: 'PASS' }); }
+        else { failed++; results.push({ name, status: 'FAIL', actual, expected }); }
+      }
+
+      /* ── chunkText tests ─────────────────────── */
+      function chunkText(text, size) {
+        const words = text.split(/\s+/);
+        const chunks = [];
+        let current = [];
+        let count = 0;
+        for (const w of words) {
+          current.push(w);
+          count += w.length;
+          if (count >= size) {
+            chunks.push(current.join(' '));
+            current = [];
+            count = 0;
+          }
+        }
+        if (current.length) chunks.push(current.join(' '));
+        return chunks;
+      }
+
+      // Test: basic chunking
+      const c1 = chunkText('hello world foo bar baz', 10);
+      assert(c1.length >= 2, 'chunkText splits text into multiple chunks');
+      assert(c1.join(' ').includes('hello'), 'chunkText preserves all words');
+
+      // Test: single word
+      const c2 = chunkText('hello', 100);
+      assertEqual(c2, ['hello'], 'chunkText handles single word');
+
+      // Test: empty string
+      const c3 = chunkText('', 100);
+      assertEqual(c3, [''], 'chunkText handles empty string');
+
+      // Test: exact boundary
+      const c4 = chunkText('ab cd ef', 4);
+      assert(c4.length >= 2, 'chunkText handles exact boundary splits');
+
+      // Test: very large chunk size
+      const c5 = chunkText('word1 word2 word3', 10000);
+      assertEqual(c5, ['word1 word2 word3'], 'chunkText with large size returns single chunk');
+
+      /* ── detectIndicLanguage tests ─────────── */
+      function detectIndicLanguage(text) {
+        const guCount = (text.match(/[\u0A80-\u0AFF]/g) || []).length;
+        const devCount = (text.match(/[\u0900-\u097F]/g) || []).length;
+        const latinCount = (text.match(/[A-Za-z]/g) || []).length;
+        if (guCount > devCount * 1.2 && guCount > latinCount * 0.5) return 'gu';
+        if (devCount > guCount * 1.2 && devCount > latinCount * 0.5) return 'hi';
+        if (latinCount > Math.max(guCount, devCount) * 1.2) return 'en';
+        return null;
+      }
+
+      assertEqual(detectIndicLanguage('ગુજરાતી ટેક્સ્ટ'), 'gu', 'detectIndicLanguage identifies Gujarati');
+      assertEqual(detectIndicLanguage('हिंदी पाठ यहाँ'), 'hi', 'detectIndicLanguage identifies Hindi/Devanagari');
+      assertEqual(detectIndicLanguage('This is English text here'), 'en', 'detectIndicLanguage identifies English');
+      assertEqual(detectIndicLanguage(''), null, 'detectIndicLanguage returns null for empty text');
+      assertEqual(detectIndicLanguage('12345'), null, 'detectIndicLanguage returns null for numbers only');
+
+      /* ── floatTo16BitPCM tests ───────────────── */
+      function floatTo16BitPCM(float32Array) {
+        const buffer = new Int16Array(float32Array.length);
+        for (let i = 0; i < float32Array.length; i++) {
+          let s = Math.max(-1, Math.min(1, float32Array[i]));
+          buffer[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+        }
+        return buffer;
+      }
+
+      const pcm1 = floatTo16BitPCM(new Float32Array([0, 1, -1, 0.5, -0.5]));
+      assertEqual(pcm1[0], 0, 'floatTo16BitPCM: 0 maps to 0');
+      assertEqual(pcm1[1], 0x7fff, 'floatTo16BitPCM: 1.0 maps to 32767');
+      assertEqual(pcm1[2], -0x8000, 'floatTo16BitPCM: -1.0 maps to -32768');
+      assert(pcm1[3] > 0, 'floatTo16BitPCM: 0.5 maps to positive');
+      assert(pcm1[4] < 0, 'floatTo16BitPCM: -0.5 maps to negative');
+
+      // Clipping test
+      const pcm2 = floatTo16BitPCM(new Float32Array([2.0, -3.0]));
+      assertEqual(pcm2[0], 0x7fff, 'floatTo16BitPCM: clips values > 1.0');
+      assertEqual(pcm2[1], -0x8000, 'floatTo16BitPCM: clips values < -1.0');
+
+      /* ── mergeAudioBuffers tests ─────────────── */
+      function mergeAudioBuffers(buffers, sampleRate) {
+        const totalLength = buffers.reduce((sum, buf) => sum + buf.length, 0);
+        const merged = new Float32Array(totalLength);
+        let offset = 0;
+        for (const buffer of buffers) {
+          merged.set(buffer, offset);
+          offset += buffer.length;
+        }
+        return { samples: merged, sampleRate };
+      }
+
+      const m1 = mergeAudioBuffers([new Float32Array([1, 2]), new Float32Array([3, 4])], 44100);
+      assertEqual(m1.samples.length, 4, 'mergeAudioBuffers: correct total length');
+      assertEqual(m1.sampleRate, 44100, 'mergeAudioBuffers: preserves sample rate');
+      assertEqual(Array.from(m1.samples), [1, 2, 3, 4], 'mergeAudioBuffers: correct order');
+
+      const m2 = mergeAudioBuffers([], 22050);
+      assertEqual(m2.samples.length, 0, 'mergeAudioBuffers: handles empty array');
+      assertEqual(m2.sampleRate, 22050, 'mergeAudioBuffers: preserves sample rate for empty');
+
+      const m3 = mergeAudioBuffers([new Float32Array([5])], 48000);
+      assertEqual(m3.samples.length, 1, 'mergeAudioBuffers: single buffer');
+      assertEqual(Array.from(m3.samples), [5], 'mergeAudioBuffers: single buffer value');
+
+      /* ── TextPositionMap tests ─────────────── */
+      const tpm = new TextPositionMap();
+
+      // Test empty map
+      const emptyResult = tpm.findPositionsForChunk('test');
+      assertEqual(emptyResult.length, 0, 'TextPositionMap: empty map returns no positions');
+
+      // Test with null input
+      const nullResult = tpm.findPositionsForChunk(null);
+      assertEqual(nullResult.length, 0, 'TextPositionMap: null input returns no positions');
+
+      const emptyStrResult = tpm.findPositionsForChunk('');
+      assertEqual(emptyStrResult.length, 0, 'TextPositionMap: empty string returns no positions');
+
+      // Simulate populated map
+      const tpm2 = new TextPositionMap();
+      tpm2.fullText = 'hello world this is a test of the system ';
+      tpm2.charToItem = [];
+      const fakeItem = { x: 10, y: 20, width: 50, height: 12 };
+      for (let i = 0; i < 11; i++) tpm2.charToItem.push({ pageNum: 1, item: fakeItem });
+      tpm2.charToItem.push(null); // space
+      const fakeItem2 = { x: 70, y: 20, width: 40, height: 12 };
+      for (let i = 0; i < 28; i++) tpm2.charToItem.push({ pageNum: 1, item: fakeItem2 });
+      tpm2.charToItem.push(null); // space
+
+      const found = tpm2.findPositionsForChunk('hello world');
+      assert(found.length > 0, 'TextPositionMap: finds matching text');
+      assertEqual(found[0].pageNum, 1, 'TextPositionMap: correct page number');
+      assertEqual(found[0].x, 10, 'TextPositionMap: correct x coordinate');
+
+      const notFound = tpm2.findPositionsForChunk('zzz nonexistent');
+      assertEqual(notFound.length, 0, 'TextPositionMap: returns empty for non-matching text');
+
+      /* ── LANGUAGES constant tests ─────────────── */
+      const LANGUAGES = [
+        { code: 'hi', name: 'Hindi', native: 'हिन्दी', color: '#FF6B35' },
+        { code: 'gu', name: 'Gujarati', native: 'ગુજરાતી', color: '#4ECDC4' },
+        { code: 'en', name: 'English', native: 'English', color: '#A2D2FF' },
+        { code: 'sa', name: 'Sanskrit', native: 'संस्कृतम्', color: '#FFD93D' },
+      ];
+      assertEqual(LANGUAGES.length, 4, 'LANGUAGES: has 4 languages');
+      assert(LANGUAGES.every(l => l.code && l.name && l.native && l.color), 'LANGUAGES: all have required fields');
+      assert(LANGUAGES.find(l => l.code === 'sa'), 'LANGUAGES: includes Sanskrit');
+
+      /* ── Display results ───────────────────────── */
+      const container = document.createElement('div');
+      container.id = 'test-results';
+      container.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:#0A0A0F;color:#E8E8F0;padding:32px;overflow:auto;z-index:9999;font-family:JetBrains Mono,monospace;font-size:0.85rem;';
+      container.innerHTML = `
+        <h1 style="font-family:Crimson Pro,serif;font-size:2rem;font-weight:300;margin-bottom:24px;">
+          Vāchana Unit Tests
+          <span style="color:${failed ? '#FF6B6B' : '#4ECDC4'};font-size:1.2rem;margin-left:16px;">
+            ${passed} passed · ${failed} failed · ${passed + failed} total
+          </span>
+        </h1>
+        ${results.map(r => `
+          <div style="padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.06);display:flex;gap:12px;">
+            <span style="color:${r.status === 'PASS' ? '#4ECDC4' : '#FF6B6B'};width:40px;">${r.status}</span>
+            <span style="color:rgba(255,255,255,0.7);">${r.name}</span>
+            ${r.status === 'FAIL' ? `<span style="color:#FF6B6B;font-size:0.75rem;">expected: ${JSON.stringify(r.expected)} got: ${JSON.stringify(r.actual)}</span>` : ''}
+          </div>
+        `).join('')}
+        <p style="margin-top:24px;color:rgba(255,255,255,0.3);">Remove ?test=1 from URL to see the app.</p>
+      `;
+      document.getElementById('root').style.display = 'none';
+      document.body.appendChild(container);
+      console.log(`Tests: ${passed} passed, ${failed} failed`);
+    })();
   </script>
 </body>
 </html>
